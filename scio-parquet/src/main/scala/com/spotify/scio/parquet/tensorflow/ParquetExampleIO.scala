@@ -18,14 +18,17 @@
 package com.spotify.scio.parquet.tensorflow
 
 import java.lang.{Boolean => JBoolean}
+import java.nio.channels.SeekableByteChannel
 
 import com.spotify.scio.ScioContext
 import com.spotify.scio.io.{ScioIO, Tap, TapOf, TapT}
-import com.spotify.scio.parquet.GcsConnectorUtil
+import com.spotify.scio.parquet.{BeamParquetInputFile, GcsConnectorUtil}
 import com.spotify.scio.util.ScioUtil
 import com.spotify.scio.values.SCollection
-import me.lyh.parquet.tensorflow.{ExampleParquetInputFormat, Schema}
+import me.lyh.parquet.tensorflow.{ExampleParquetInputFormat, ExampleParquetReader, Schema}
+import org.apache.beam.sdk.io.{DefaultFilenamePolicy, DynamicFileDestinations, FileBasedSink, FileSystems, WriteFiles}
 import org.apache.beam.sdk.io.hadoop.format.HadoopFormatIO
+import org.apache.beam.sdk.options.ValueProvider.StaticValueProvider
 import org.apache.beam.sdk.transforms.SimpleFunction
 import org.apache.hadoop.mapreduce.Job
 import org.apache.parquet.filter2.predicate.FilterPredicate
@@ -69,8 +72,22 @@ final case class ParquetExampleIO(path: String) extends ScioIO[Example] {
       GcsConnectorUtil.setCredentials(job)
     }
 
-
-    ???
+    val resource =
+      FileBasedSink.convertToFileResourceIfPossible(ScioUtil.pathWithShards(path))
+    val prefix = StaticValueProvider.of(resource)
+    val usedFilenamePolicy =
+      DefaultFilenamePolicy.fromStandardParameters(prefix, null, params.suffix, false)
+    val destinations = DynamicFileDestinations.constant[Example](usedFilenamePolicy)
+    val sink = new ParquetExampleSink(
+      prefix,
+      destinations,
+      params.schema,
+      job.getConfiguration,
+      params.compression
+    )
+    val t = WriteFiles.to(sink).withNumShards(params.numShards)
+    data.applyInternal(t)
+    tap(ParquetExampleIO.ReadParam())
   }
 
   override def tap(read: ReadP): Tap[tapT.T] = ???
@@ -83,16 +100,40 @@ object ParquetExampleIO {
   )
 
   object WriteParam {
-    private[tensorflow] val DefaultSchema = null
     private[tensorflow] val DefaultNumShards = 0
     private[tensorflow] val DefaultSuffix = ".parquet"
     private[tensorflow] val DefaultCompression = CompressionCodecName.SNAPPY
   }
 
   final case class WriteParam private (
-    schema: Schema = WriteParam.DefaultSchema,
+    schema: Schema,
     numShards: Int = WriteParam.DefaultNumShards,
     suffix: String = WriteParam.DefaultSuffix,
     compression: CompressionCodecName = WriteParam.DefaultCompression
   )
+}
+
+case class ParquetExapmleTap(path: String, params: ParquetExampleIO.ReadParam)
+  extends Tap[Example] {
+  override def value: Iterator[Example] = {
+    val xs = FileSystems.`match`(path).metadata().asScala.toList
+    xs.iterator.flatMap { metadata =>
+      val channel = FileSystems
+        .open(metadata.resourceId())
+        .asInstanceOf[SeekableByteChannel]
+      val reader =
+        ExampleParquetReader.builder(new BeamParquetInputFile(channel)).build()
+      new Iterator[Example] {
+        private var current: Example = reader.read()
+        override def hasNext: Boolean = current != null
+        override def next(): Example = {
+          val r = current
+          current = reader.read()
+          r
+        }
+      }
+    }
+  }
+
+  override def open(sc: ScioContext): SCollection[Example] = sc.read(ParquetExampleIO(path))(params)
 }
